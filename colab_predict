@@ -1,0 +1,100 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv1D, LSTM, Dense, Dropout, Bidirectional, BatchNormalization, Reshape
+from tensorflow.keras.layers import MultiHeadAttention, LayerNormalization, Add
+import datetime
+
+# 自定义Transformer编码器层
+def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
+    attention_output = MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout)(inputs, inputs)
+    attention_output = Dropout(dropout)(attention_output)
+    attention_output = LayerNormalization(epsilon=1e-6)(attention_output)
+    attention_output = Add()([attention_output, inputs])
+
+    ff_output = Dense(ff_dim, activation='relu')(attention_output)
+    ff_output = Dropout(dropout)(ff_output)
+    ff_output = Dense(inputs.shape[-1])(ff_output)
+    ff_output = LayerNormalization(epsilon=1e-6)(ff_output)
+    ff_output = Add()([ff_output, attention_output])
+    return ff_output
+
+# 加载模型
+model_path = '/content/drive/MyDrive/Basel_project/model/deep_optimized_weather_model_with_self_attention_tpu.h5'
+model = tf.keras.models.load_model(model_path, custom_objects={'transformer_encoder': transformer_encoder})
+
+# 数据加载和预处理函数
+def preprocess_data(data_path):
+    raw_data = pd.read_csv(data_path, dtype={'timestamp': str}, low_memory=False)
+
+    # 时间特征提取与编码
+    raw_data['timestamp'] = pd.to_datetime(raw_data['timestamp'], format='%Y%m%dT%H%M')
+    raw_data['year'] = raw_data['timestamp'].dt.year
+    raw_data['month'] = raw_data['timestamp'].dt.month
+    raw_data['day'] = raw_data['timestamp'].dt.day
+    raw_data['hour'] = raw_data['timestamp'].dt.hour
+
+    # 使用正弦和余弦变换编码周期性时间特征
+    raw_data['sin_month'] = np.sin(2 * np.pi * raw_data['month'] / 12)
+    raw_data['cos_month'] = np.cos(2 * np.pi * raw_data['month'] / 12)
+    raw_data['sin_hour'] = np.sin(2 * np.pi * raw_data['hour'] / 24)
+    raw_data['cos_hour'] = np.cos(2 * np.pi * raw_data['hour'] / 24)
+
+    # 合成特征：风速与风向
+    raw_data['wind_u'] = raw_data['Basel Wind Speed [10 m]'] * np.cos(np.deg2rad(raw_data['Basel Wind Direction [10 m]']))
+    raw_data['wind_v'] = raw_data['Basel Wind Speed [10 m]'] * np.sin(np.deg2rad(raw_data['Basel Wind Direction [10 m]']))
+
+    # 删除无用的时间特征
+    raw_data = raw_data.drop(columns=['timestamp', 'year', 'month', 'day', 'hour', 'Basel Wind Direction [10 m]'])
+
+    # 数据清洗与标准化
+    numeric_data = raw_data.fillna(raw_data.mean())
+    scaler = MinMaxScaler()
+    numeric_data_scaled = scaler.fit_transform(numeric_data)
+
+    # 合并时间特征与标准化数据
+    combined_data = np.hstack((numeric_data_scaled, raw_data[['sin_month', 'cos_month', 'sin_hour', 'cos_hour']].values))
+    return combined_data, scaler, numeric_data.columns.tolist(), raw_data[['sin_month', 'cos_month', 'sin_hour', 'cos_hour']].columns.tolist()
+
+# 读取数据
+data_path = '/content/drive/MyDrive/Basel_project/data/allclasses.csv'
+combined_data, scaler, numeric_columns, time_columns = preprocess_data(data_path)
+
+# 获取最近30天的数据
+recent_30_days_data = combined_data[-30:]
+
+# 扩展维度以匹配模型输入
+recent_30_days_data = np.expand_dims(recent_30_days_data, axis=0)
+
+# 使用模型进行预测
+predicted = model.predict(recent_30_days_data)
+
+# 逆标准化预测结果
+predicted = predicted.reshape(3, -1, predicted.shape[-1])
+
+# 只逆标准化数值特征部分
+predicted_numeric = predicted[:, :, :len(numeric_columns)]
+predicted_inverse_numeric = []
+
+for i in range(predicted_numeric.shape[0]):
+    single_day_prediction = predicted_numeric[i]
+    single_day_inverse = scaler.inverse_transform(single_day_prediction)
+    predicted_inverse_numeric.append(single_day_inverse)
+
+predicted_inverse_numeric = np.array(predicted_inverse_numeric)
+
+# 合并逆标准化后的数值特征与原时间特征
+predicted_inverse = np.concatenate([predicted_inverse_numeric, predicted[:, :, len(numeric_columns):]], axis=-1)
+
+# 获取当前日期
+current_date = datetime.datetime.now()
+
+# 输出预测结果
+for day in range(3):
+    date = current_date + datetime.timedelta(days=day + 1)
+    print(f"Predicted data for {date.strftime('%Y-%m-%d')}:")
+    for i, column in enumerate(numeric_columns + time_columns):
+        print(f"{column}: {predicted_inverse[day, 0, i]:.2f}")
+    print("\n")
