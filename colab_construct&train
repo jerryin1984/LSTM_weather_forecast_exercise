@@ -1,0 +1,147 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Conv1D, LSTM, Dense, Dropout, Bidirectional, BatchNormalization, Reshape
+from tensorflow.keras.layers import MultiHeadAttention, LayerNormalization, Add
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+# TPU初始化
+try:
+    tpu = tf.distribute.cluster_resolver.TPUClusterResolver()
+    print('Running on TPU ', tpu.master())
+    tf.config.experimental_connect_to_cluster(tpu)
+    tf.tpu.experimental.initialize_tpu_system(tpu)
+    strategy = tf.distribute.TPUStrategy(tpu)
+except ValueError:
+    print("No TPU found, falling back to CPU/GPU")
+    strategy = tf.distribute.get_strategy()
+
+print("REPLICAS: ", strategy.num_replicas_in_sync)
+
+# 自定义Transformer编码器层
+def transformer_encoder(inputs, head_size, num_heads, ff_dim, dropout=0):
+    attention_output = MultiHeadAttention(key_dim=head_size, num_heads=num_heads, dropout=dropout)(inputs, inputs)
+    attention_output = Dropout(dropout)(attention_output)
+    attention_output = LayerNormalization(epsilon=1e-6)(attention_output)
+    attention_output = Add()([attention_output, inputs])
+
+    ff_output = Dense(ff_dim, activation='relu')(attention_output)
+    ff_output = Dropout(dropout)(ff_output)
+    ff_output = Dense(inputs.shape[-1])(ff_output)
+    ff_output = LayerNormalization(epsilon=1e-6)(ff_output)
+    ff_output = Add()([ff_output, attention_output])
+    return ff_output
+
+# 数据加载和预处理
+data_path = '/content/drive/MyDrive/Basel_project/data/allclasses.csv'
+raw_data = pd.read_csv(data_path, dtype={'timestamp': str}, low_memory=False)
+
+# 时间特征提取与编码
+raw_data['timestamp'] = pd.to_datetime(raw_data['timestamp'], format='%Y%m%dT%H%M')
+raw_data['year'] = raw_data['timestamp'].dt.year
+raw_data['month'] = raw_data['timestamp'].dt.month
+raw_data['day'] = raw_data['timestamp'].dt.day
+raw_data['hour'] = raw_data['timestamp'].dt.hour
+
+# 使用正弦和余弦变换编码周期性时间特征
+raw_data['sin_month'] = np.sin(2 * np.pi * raw_data['month'] / 12)
+raw_data['cos_month'] = np.cos(2 * np.pi * raw_data['month'] / 12)
+raw_data['sin_hour'] = np.sin(2 * np.pi * raw_data['hour'] / 24)
+raw_data['cos_hour'] = np.cos(2 * np.pi * raw_data['hour'] / 24)
+
+# 合成特征：风速与风向
+raw_data['wind_u'] = raw_data['Basel Wind Speed [10 m]'] * np.cos(np.deg2rad(raw_data['Basel Wind Direction [10 m]']))
+raw_data['wind_v'] = raw_data['Basel Wind Speed [10 m]'] * np.sin(np.deg2rad(raw_data['Basel Wind Direction [10 m]']))
+
+# 删除无用的时间特征
+raw_data = raw_data.drop(columns=['timestamp', 'year', 'month', 'day', 'hour', 'Basel Wind Direction [10 m]'])
+
+# 数据清洗与标准化
+numeric_data = raw_data.fillna(raw_data.mean())
+scaler = MinMaxScaler()
+numeric_data_scaled = scaler.fit_transform(numeric_data)
+
+# 合并时间特征与标准化数据
+combined_data = np.hstack((numeric_data_scaled, raw_data[['sin_month', 'cos_month', 'sin_hour', 'cos_hour']].values))
+
+# 准备训练数据
+window_size = 30  # 输入窗口大小为30天
+output_size = 3  # 输出窗口大小为3天
+X, y = [], []
+for i in range(len(combined_data) - window_size - output_size):
+    X.append(combined_data[i:i + window_size])
+    y.append(combined_data[i + window_size:i + window_size + output_size])
+
+X, y = np.array(X), np.array(y)
+
+# 数据集拆分
+split_index = int(0.8 * len(X))
+X_train, X_test = X[:split_index], X[split_index:]
+y_train, y_test = y[:split_index], y[split_index:]
+
+# 使用 tf.data API 优化数据加载
+def create_tf_dataset(X, y, batch_size):
+    dataset = tf.data.Dataset.from_tensor_slices((X, y))
+    dataset = dataset.shuffle(buffer_size=len(X))
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
+    return dataset
+
+batch_size = 65536
+train_dataset = create_tf_dataset(X_train, y_train, batch_size)
+test_dataset = create_tf_dataset(X_test, y_test, batch_size)
+
+with strategy.scope():
+    # 模型构建
+    input_layer = Input(shape=(window_size, X_train.shape[2]))
+
+    # 多层CNN提取局部特征
+    x = Conv1D(filters=128, kernel_size=3, padding='same', activation='relu')(input_layer)
+    x = Dropout(0.3)(x)
+    x = BatchNormalization()(x)
+
+    x = Conv1D(filters=128, kernel_size=3, padding='same', activation='relu')(x)
+    x = Dropout(0.3)(x)
+    x = BatchNormalization()(x)
+
+    # 多层Bidirectional LSTM处理序列依赖
+    x = Bidirectional(LSTM(256, return_sequences=True))(x)
+    x = Dropout(0.3)(x)
+    x = BatchNormalization()(x)
+
+    x = Bidirectional(LSTM(256, return_sequences=True))(x)
+    x = Dropout(0.3)(x)
+    x = BatchNormalization()(x)
+
+    # 多层自注意力机制
+    x = transformer_encoder(x, head_size=256, num_heads=4, ff_dim=128, dropout=0.3)
+    x = transformer_encoder(x, head_size=256, num_heads=4, ff_dim=128, dropout=0.3)
+
+    # 最终的Bidirectional LSTM层
+    x = Bidirectional(LSTM(128, return_sequences=False))(x)
+    x = Dropout(0.3)(x)
+    x = BatchNormalization()(x)
+
+    # 输出层
+    output = Dense(y_train.shape[1] * y_train.shape[2])(x)  # 输出预测未来3天的所有特征
+    output = Reshape((output_size, y_train.shape[2]))(output)  # 调整输出形状
+
+    model = Model(inputs=input_layer, outputs=output)
+    model.compile(optimizer='adam', loss='mse')
+
+# 打印模型结构
+model.summary()
+
+# 训练设置
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.0001)
+
+# 训练模型
+history = model.fit(train_dataset, epochs=300, validation_data=test_dataset, callbacks=[early_stopping, reduce_lr])
+
+# 模型保存
+model_save_path = '/content/drive/MyDrive/Basel_project/model/deep_optimized_weather_model_with_self_attention_tpu.h5'
+model.save(model_save_path)
+print(f"Model saved to {model_save_path}")
